@@ -1,6 +1,18 @@
-// Hybrid FGV-CS spanner (Sec. 4.3 of the paper) + helpers for the modified HCIS-r (Sec. 4.1).
+// CS (Sec. 3.3) and hybrid FGV-CS (Sec. 4.3) spanner pipelines.
+//
+// Everything stays on the GPU until the final, already sorted and de-duplicated edge list.
+//
+// Inter-cluster edges (shared by CS and FGV-CS), for every pair of adjacent clusters A, B with
+// tree depths ecc[A], ecc[B]:
+//   * if 2*ecc[A] + 2*ecc[B] + 1 <= stretch, ONE edge between A and B already gives every A-B edge a
+//     path of length <= stretch (this is the "single edge if the diameters allow it" rule of Sec. 5.2);
+//   * otherwise every boundary vertex u adds one edge into each adjacent cluster C, but only if
+//     u may act as a source (MPVX-Rule: cid(u) < cid(C); in the hybrid all high-coverage (D) vertices
+//     are sources towards residual (B) clusters, exactly Case 2 of Sec. 4.3). Lemma 2.1 only needs one
+//     of the two endpoints of every inter-cluster edge to add an edge, so D-D pairs use the id rule.
 #include "algorithms/compact/fgv_compact.hpp"
 #include "gpu/compact_kernels.hpp"
+#include "gpu/edge_finalize.hpp"
 #include "gpu/kernels.hpp"
 #include "compact_internal.hpp"
 
@@ -23,7 +35,7 @@ namespace
 {
     using spanner::detail::kBlockSize;
 
-    // ---------------------------------------------------------------- BFS growth
+    // ---------------------------------------------------------------- BFS growth (race-free, level synchronous)
     __global__ void init_bfs_kernel(int n,const int* is_center,int* dist,int* cen,int* par)
     {
         const int v = blockIdx.x * blockDim.x + threadIdx.x;
@@ -40,7 +52,7 @@ namespace
         par[v] = c ? v : -1;
     }
 
-    // Level-synchronous: only vertices at level-1 are read, and they are never written in this launch.
+    // Only vertices at level-1 are read, and they are never written in this launch.
     __global__ void bfs_level_kernel(int n,int level,const int* offsets,const int* neighbors,int* dist,int* cen,int* par,int* changed)
     {
         const int v = blockIdx.x * blockDim.x + threadIdx.x;
@@ -73,32 +85,132 @@ namespace
         }
     }
 
-    __global__ void count_boundary_kernel(int n,int radius,const int* offsets,const int* neighbors,const int* dist,unsigned long long* total)
+    // Safety net: HCIS-r is maximal, so this should never trigger.
+    __global__ void fix_unreached_kernel(int n,int* dist,int* cen,int* par)
     {
         const int v = blockIdx.x * blockDim.x + threadIdx.x;
 
-        if(v >= n || dist[v] != radius)
+        if(v < n && dist[v] < 0)
+        {
+            dist[v] = 0;
+            cen[v] = v;
+            par[v] = v;
+        }
+    }
+
+    // ---------------------------------------------------------------- edge sink (packed (min<<32)|max)
+    __device__ __forceinline__ void append_edge(std::uint64_t* sink,int* count,int capacity,int a,int b)
+    {
+        if(a == b)
         {
             return;
         }
 
-        unsigned long long local = 0;
+        const int lo = a < b ? a : b;
+        const int hi = a < b ? b : a;
+        const int p = atomicAdd(count,1);
 
-        for(int e = offsets[v];e < offsets[v + 1];++e)
+        if(p < capacity)
         {
-            if(dist[neighbors[e]] == radius + 1)
-            {
-                ++local;
-            }
-        }
-
-        if(local > 0)
-        {
-            atomicAdd(total,local);
+            sink[p] = (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
         }
     }
 
-    // ---------------------------------------------------------------- residual graph (vertices not in a D cluster)
+    __global__ void tree_append_kernel(int n,const int* dist,const int* par,std::uint64_t* sink,int* count,int capacity)
+    {
+        const int v = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if(v < n && dist[v] > 0 && par[v] >= 0 && par[v] != v)
+        {
+            append_edge(sink,count,capacity,v,par[v]);
+        }
+    }
+
+    __global__ void ecc_from_bfs_kernel(int n,const int* dist,const int* cen,int* ecc)
+    {
+        const int v = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if(v < n && dist[v] >= 0)
+        {
+            atomicMax(&ecc[cen[v]],dist[v]);
+        }
+    }
+
+    // ---------------------------------------------------------------- inter-cluster edges
+    __global__ void inter_candidates_kernel(int n,const int* offsets,const int* neighbors,const int* cluster,const int* source_mask,const int* ecc,int stretch,std::uint64_t* keys,std::uint64_t* vals,int* candidate_count)
+    {
+        const int u = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if(u >= n)
+        {
+            return;
+        }
+
+        const int cu = cluster[u];
+
+        if(cu < 0)
+        {
+            return;
+        }
+
+        const bool u_source = source_mask == nullptr || source_mask[u] != 0;
+
+        for(int e = offsets[u];e < offsets[u + 1];++e)
+        {
+            const int w = neighbors[e];
+            const int cw = cluster[w];
+
+            if(cw < 0 || cw == cu)
+            {
+                continue;
+            }
+
+            const bool w_source = source_mask == nullptr || source_mask[w] != 0;
+
+            if(!u_source && !w_source)
+            {
+                continue;   // residual-residual pairs are handled by FGV's own FGV-Rule (Case 1)
+            }
+
+            std::uint64_t key;
+
+            if(2 * ecc[cu] + 2 * ecc[cw] + 1 <= stretch)
+            {
+                if(cu > cw)
+                {
+                    continue;   // one direction records the pair
+                }
+
+                key = (1ULL << 63) | (static_cast<std::uint64_t>(cu) * static_cast<std::uint64_t>(n) + static_cast<std::uint64_t>(cw));
+            }
+            else
+            {
+                if(!u_source || (w_source && cu > cw))
+                {
+                    continue;
+                }
+
+                key = static_cast<std::uint64_t>(u) * static_cast<std::uint64_t>(n) + static_cast<std::uint64_t>(cw);
+            }
+
+            const int pos = atomicAdd(candidate_count,1);
+
+            keys[pos] = key;
+            vals[pos] = (static_cast<std::uint64_t>(u) << 32) | static_cast<std::uint64_t>(w);
+        }
+    }
+
+    __global__ void inter_emit_kernel(int count,const std::uint64_t* vals,std::uint64_t* sink,int* sink_count,int capacity)
+    {
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if(i < count)
+        {
+            append_edge(sink,sink_count,capacity,static_cast<int>(vals[i] >> 32),static_cast<int>(vals[i] & 0xFFFFFFFFULL));
+        }
+    }
+
+    // ---------------------------------------------------------------- residual graph (hybrid only)
     __global__ void flag_residual_kernel(int n,const int* dist,int* flag)
     {
         const int v = blockIdx.x * blockDim.x + threadIdx.x;
@@ -157,8 +269,29 @@ namespace
         }
     }
 
-    // ---------------------------------------------------------------- final cluster ids + edges
-    __global__ void assemble_cluster_kernel(int n,const int* dist,const int* cen,const int* newid,const int* res_cen,const int* old_of_new,int* cluster)
+    __global__ void residual_edges_append_kernel(const int* count_ptr,const int* f_src,const int* f_dst,const int* old_of_new,std::uint64_t* sink,int* sink_count,int capacity)
+    {
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if(i < *count_ptr)
+        {
+            append_edge(sink,sink_count,capacity,old_of_new[f_src[i]],old_of_new[f_dst[i]]);
+        }
+    }
+
+    // FGV cluster tree depth of i = level(i) - level(center); recorded per (original) center id.
+    __global__ void ecc_from_fgv_kernel(int n_res,const int* r_dist,const int* r_cen,const int* old_of_new,int* ecc)
+    {
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if(i < n_res)
+        {
+            const int c = r_cen[i];
+            atomicMax(&ecc[old_of_new[c]],r_dist[i] - r_dist[c]);
+        }
+    }
+
+    __global__ void assemble_cluster_kernel(int n,const int* dist,const int* cen,const int* newid,const int* res_cen,const int* old_of_new,int* cluster,int* d_mask)
     {
         const int v = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -167,47 +300,13 @@ namespace
             return;
         }
 
-        cluster[v] = dist[v] >= 0 ? cen[v] : old_of_new[res_cen[newid[v]]];
+        const bool in_d = dist[v] >= 0;
+
+        cluster[v] = in_d ? cen[v] : old_of_new[res_cen[newid[v]]];
+        d_mask[v] = in_d ? 1 : 0;
     }
 
-    __global__ void tree_edges_kernel(int n,const int* dist,const int* par,int* count,int* src,int* dst)
-    {
-        const int v = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if(v >= n || dist[v] <= 0 || par[v] < 0 || par[v] == v)
-        {
-            return;
-        }
-
-        const int p = atomicAdd(count,1);
-
-        src[p] = v;
-        dst[p] = par[v];
-    }
-
-    // Case 2: boundary vertex u of a D cluster -> candidate edge into each adjacent cluster.
-    __global__ void case2_candidates_kernel(int n,const int* offsets,const int* neighbors,const int* dist,const int* cluster,std::uint64_t* keys,int* dsts)
-    {
-        const int u = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if(u >= n || dist[u] < 0)
-        {
-            return;
-        }
-
-        for(int e = offsets[u];e < offsets[u + 1];++e)
-        {
-            const int w = neighbors[e];
-
-            if(cluster[w] != cluster[u])
-            {
-                keys[e] = static_cast<std::uint64_t>(u) * static_cast<std::uint64_t>(n) + static_cast<std::uint64_t>(cluster[w]);
-                dsts[e] = w;
-            }
-        }
-    }
-
-    void sync(const char* what)
+    void sync_check(const char* what)
     {
         spanner::detail::check_cuda(cudaGetLastError(),what);
         spanner::detail::check_cuda(cudaDeviceSynchronize(),what);
@@ -237,14 +336,14 @@ namespace spanner
         DeviceBuffer<int> changed(1);
 
         init_bfs_kernel<<<blocks,kBlockSize>>>(num_vertices,is_center,distances,centers,parents);
-        sync("BFS initialization failed");
+        check_cuda(cudaGetLastError(),"BFS initialization failed");
 
         for(int level = 1;level <= depth;++level)
         {
             check_cuda(cudaMemset(changed.get(),0,sizeof(int)),"Failed to reset BFS flag");
 
             bfs_level_kernel<<<blocks,kBlockSize>>>(num_vertices,level,offsets,neighbors,distances,centers,parents,changed.get());
-            sync("BFS level failed");
+            check_cuda(cudaGetLastError(),"BFS level failed");
 
             int host_changed = 0;
 
@@ -257,25 +356,98 @@ namespace spanner
         }
     }
 
-    long long count_compact_boundary_edges(int num_vertices,int radius,const int* offsets,const int* neighbors,const int* seeds)
+    namespace
     {
-        DeviceBuffer<int> dist(num_vertices),cen(num_vertices),par(num_vertices);
-        DeviceBuffer<unsigned long long> total(1);
+        void add_inter_cluster_edges(int n,int adj,const int* offsets,const int* neighbors,const int* cluster,const int* source_mask,const int* ecc,int stretch,std::uint64_t* sink,int* sink_count,int capacity)
+        {
+            if(adj <= 0)
+            {
+                return;
+            }
 
-        grow_compact_bfs(num_vertices,radius + 1,offsets,neighbors,seeds,dist.get(),cen.get(),par.get());
+            DeviceBuffer<std::uint64_t> keys(adj),vals(adj);
+            DeviceBuffer<int> candidate_count(1);
 
-        check_cuda(cudaMemset(total.get(),0,sizeof(unsigned long long)),"Failed to reset boundary counter");
+            check_cuda(cudaMemset(candidate_count.get(),0,sizeof(int)),"Failed to reset candidate counter");
 
-        count_boundary_kernel<<<grid_size(num_vertices),kBlockSize>>>(num_vertices,radius,offsets,neighbors,dist.get(),total.get());
-        sync("Boundary edge count failed");
+            inter_candidates_kernel<<<grid_size(n),kBlockSize>>>(n,offsets,neighbors,cluster,source_mask,ecc,stretch,keys.get(),vals.get(),candidate_count.get());
+            check_cuda(cudaGetLastError(),"Inter-cluster candidates failed");
 
-        unsigned long long host_total = 0;
+            int candidates = 0;
 
-        check_cuda(cudaMemcpy(&host_total,total.get(),sizeof(host_total),cudaMemcpyDeviceToHost),"Failed to read boundary count");
+            check_cuda(cudaMemcpy(&candidates,candidate_count.get(),sizeof(int),cudaMemcpyDeviceToHost),"Failed to read candidate count");
 
-        return static_cast<long long>(host_total);
+            if(candidates <= 0)
+            {
+                return;
+            }
+
+            thrust::sort_by_key(dp(keys.get()),dp(keys.get()) + candidates,dp(vals.get()));
+
+            const auto unique_end = thrust::unique_by_key(dp(keys.get()),dp(keys.get()) + candidates,dp(vals.get()));
+            const int unique_count = static_cast<int>(unique_end.first - dp(keys.get()));
+
+            inter_emit_kernel<<<grid_size(unique_count),kBlockSize>>>(unique_count,vals.get(),sink,sink_count,capacity);
+            check_cuda(cudaGetLastError(),"Inter-cluster emit failed");
+        }
+
+        std::vector<Edge> collect(DeviceBuffer<std::uint64_t>& sink,DeviceBuffer<int>& sink_count,int capacity)
+        {
+            int count = 0;
+
+            check_cuda(cudaMemcpy(&count,sink_count.get(),sizeof(int),cudaMemcpyDeviceToHost),"Failed to read edge count");
+
+            if(count > capacity)
+            {
+                throw std::runtime_error("Spanner exceeded the allocated edge capacity");
+            }
+
+            return finalize_packed_edges(sink.get(),count);
+        }
     }
 
+    // ------------------------------------------------------------------ CS (Sec. 3.3)
+    void run_compact_pipeline(const int* offsets,const int* neighbors,int n,int adj,int radius,std::vector<Edge>& edges,int& num_centers)
+    {
+        edges.clear();
+        num_centers = 0;
+
+        if(n <= 0)
+        {
+            return;
+        }
+
+        const int blocks = grid_size(n);
+
+        DeviceBuffer<int> is_center(n),dist(n),cen(n),par(n),ecc(n);
+
+        run_hcis_r(n,radius,offsets,neighbors,is_center.get());
+
+        num_centers = thrust::reduce(dp(is_center.get()),dp(is_center.get()) + n,0);
+
+        grow_compact_bfs(n,radius,offsets,neighbors,is_center.get(),dist.get(),cen.get(),par.get());
+
+        fix_unreached_kernel<<<blocks,kBlockSize>>>(n,dist.get(),cen.get(),par.get());
+
+        check_cuda(cudaMemset(ecc.get(),0,static_cast<std::size_t>(n) * sizeof(int)),"Failed to clear cluster depths");
+        ecc_from_bfs_kernel<<<blocks,kBlockSize>>>(n,dist.get(),cen.get(),ecc.get());
+
+        const int capacity = n + adj + 16;
+        DeviceBuffer<std::uint64_t> sink(capacity);
+        DeviceBuffer<int> sink_count(1);
+
+        check_cuda(cudaMemset(sink_count.get(),0,sizeof(int)),"Failed to reset edge counter");
+
+        tree_append_kernel<<<blocks,kBlockSize>>>(n,dist.get(),par.get(),sink.get(),sink_count.get(),capacity);
+
+        add_inter_cluster_edges(n,adj,offsets,neighbors,cen.get(),nullptr,ecc.get(),2 * radius + 1,sink.get(),sink_count.get(),capacity);
+
+        sync_check("CS pipeline failed");
+
+        edges = collect(sink,sink_count,capacity);
+    }
+
+    // ------------------------------------------------------------------ hybrid FGV-CS (Sec. 4)
     FGVCompact::FGVCompact(const GPUGraph& graph,int k,int alpha)
         : graph_(graph),k_(k),alpha_(alpha)
     {
@@ -305,57 +477,38 @@ namespace spanner
         }
 
         const int r = k_ - 1;
+        const int stretch = 2 * k_ - 1;
         const int* offsets = graph_.offsets();
         const int* neighbors = graph_.neighbors();
         const int blocks = grid_size(n);
 
-        std::vector<Edge> raw;
-
-        // ---- Stage 1 + 2: high-coverage centers and their radius-r clusters (set D)
-        DeviceBuffer<int> is_center(n),dist(n),cen(n),par(n);
+        // ---- Stage 1+2: modified HCIS-r (alpha phases, beta boundary edges) and radius-r clusters (set D)
+        DeviceBuffer<int> is_center(n),dist(n),cen(n),par(n),ecc(n);
 
         const double beta_double = std::pow(static_cast<double>(n),1.0 + 1.0 / static_cast<double>(k_));
         const long long beta = static_cast<long long>(std::min(beta_double,9.0e18));
 
         run_hcis_r(n,r,offsets,neighbors,is_center.get(),alpha_,beta);
-        sync("Modified HCIS-r failed");
 
         num_centers_ = thrust::reduce(dp(is_center.get()),dp(is_center.get()) + n,0);
 
         grow_compact_bfs(n,r,offsets,neighbors,is_center.get(),dist.get(),cen.get(),par.get());
 
-        // D tree edges
-        {
-            DeviceBuffer<int> count(1),src(n),dst(n);
+        check_cuda(cudaMemset(ecc.get(),0,static_cast<std::size_t>(n) * sizeof(int)),"Failed to clear cluster depths");
+        ecc_from_bfs_kernel<<<blocks,kBlockSize>>>(n,dist.get(),cen.get(),ecc.get());
 
-            check_cuda(cudaMemset(count.get(),0,sizeof(int)),"Failed to reset tree count");
-            tree_edges_kernel<<<blocks,kBlockSize>>>(n,dist.get(),par.get(),count.get(),src.get(),dst.get());
-            sync("D tree edges failed");
+        const int capacity = 2 * n + 2 * adj + 16;
+        DeviceBuffer<std::uint64_t> sink(capacity);
+        DeviceBuffer<int> sink_count(1);
 
-            int host_count = 0;
-            check_cuda(cudaMemcpy(&host_count,count.get(),sizeof(int),cudaMemcpyDeviceToHost),"Failed to read tree count");
+        check_cuda(cudaMemset(sink_count.get(),0,sizeof(int)),"Failed to reset edge counter");
 
-            std::vector<int> hs(host_count),hd(host_count);
-
-            if(host_count > 0)
-            {
-                check_cuda(cudaMemcpy(hs.data(),src.get(),host_count * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy tree sources");
-                check_cuda(cudaMemcpy(hd.data(),dst.get(),host_count * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy tree destinations");
-            }
-
-            for(int i = 0;i < host_count;++i)
-            {
-                raw.push_back(Edge{hs[i],hd[i]});
-            }
-        }
+        tree_append_kernel<<<blocks,kBlockSize>>>(n,dist.get(),par.get(),sink.get(),sink_count.get(),capacity);
 
         // ---- Stage 3: FGV-Spanner on the vertices not covered by D (set B)
-        DeviceBuffer<int> cluster(n);
-        DeviceBuffer<int> flag(n),newid(n);
+        DeviceBuffer<int> flag(n),newid(n),cluster(n),d_mask(n);
 
         flag_residual_kernel<<<blocks,kBlockSize>>>(n,dist.get(),flag.get());
-        sync("Residual flag failed");
-
         thrust::exclusive_scan(dp(flag.get()),dp(flag.get()) + n,dp(newid.get()));
 
         int last_flag = 0,last_id = 0;
@@ -374,8 +527,6 @@ namespace spanner
             DeviceBuffer<int> deg(n),pos(n);
 
             residual_degree_kernel<<<blocks,kBlockSize>>>(n,offsets,neighbors,flag.get(),deg.get());
-            sync("Residual degree failed");
-
             thrust::exclusive_scan(dp(deg.get()),dp(deg.get()) + n,dp(pos.get()));
 
             int last_deg = 0,last_pos = 0;
@@ -387,7 +538,7 @@ namespace spanner
             DeviceBuffer<int> res_off(n_res + 1),res_nbrs(std::max(1,res_adj)),old_of_new(n_res);
 
             residual_build_kernel<<<blocks,kBlockSize>>>(n,offsets,neighbors,flag.get(),newid.get(),pos.get(),res_off.get(),res_nbrs.get(),old_of_new.get());
-            sync("Residual graph build failed");
+            check_cuda(cudaGetLastError(),"Residual graph build failed");
 
             check_cuda(cudaMemcpy(res_off.get() + n_res,&res_adj,sizeof(int),cudaMemcpyHostToDevice),"Failed to finish residual offsets");
 
@@ -402,104 +553,18 @@ namespace spanner
             build_fgv_clusters(n_res,r,res_off.get(),res_nbrs.get(),shifts.get(),r_dist.get(),r_cen.get(),r_par.get());
             build_fgv_spanner(n_res,res_off.get(),res_nbrs.get(),r_dist.get(),r_cen.get(),r_par.get(),f_count.get(),f_src.get(),f_dst.get(),res_max_edges);
 
-            int host_count = 0;
-            check_cuda(cudaMemcpy(&host_count,f_count.get(),sizeof(int),cudaMemcpyDeviceToHost),"Failed to read residual edge count");
-
-            if(host_count < 0 || host_count > res_max_edges)
-            {
-                throw std::runtime_error("Residual FGV produced an invalid edge count");
-            }
-
-            std::vector<int> hs(host_count),hd(host_count),map(n_res);
-
-            if(host_count > 0)
-            {
-                check_cuda(cudaMemcpy(hs.data(),f_src.get(),host_count * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy residual sources");
-                check_cuda(cudaMemcpy(hd.data(),f_dst.get(),host_count * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy residual destinations");
-            }
-
-            check_cuda(cudaMemcpy(map.data(),old_of_new.get(),n_res * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy residual id map");
-
-            for(int i = 0;i < host_count;++i)
-            {
-                raw.push_back(Edge{map[hs[i]],map[hd[i]]});
-            }
-
-            assemble_cluster_kernel<<<blocks,kBlockSize>>>(n,dist.get(),cen.get(),newid.get(),r_cen.get(),old_of_new.get(),cluster.get());
-            sync("Cluster assembly failed");
+            residual_edges_append_kernel<<<grid_size(res_max_edges),kBlockSize>>>(f_count.get(),f_src.get(),f_dst.get(),old_of_new.get(),sink.get(),sink_count.get(),capacity);
+            ecc_from_fgv_kernel<<<grid_size(n_res),kBlockSize>>>(n_res,r_dist.get(),r_cen.get(),old_of_new.get(),ecc.get());
+            assemble_cluster_kernel<<<blocks,kBlockSize>>>(n,dist.get(),cen.get(),newid.get(),r_cen.get(),old_of_new.get(),cluster.get(),d_mask.get());
+            sync_check("Residual FGV stage failed");
         }
 
-        // ---- Stage 4 (Case 2): one edge from each D boundary vertex into every adjacent cluster
-        if(adj > 0)
-        {
-            DeviceBuffer<std::uint64_t> keys(adj);
-            DeviceBuffer<int> dsts(adj);
+        // ---- Stage 4: inter-cluster edges involving D (Case 2), residual-residual ones came from FGV (Case 1)
+        add_inter_cluster_edges(n,adj,offsets,neighbors,cluster.get(),n_res == 0 ? nullptr : d_mask.get(),ecc.get(),stretch,sink.get(),sink_count.get(),capacity);
 
-            check_cuda(cudaMemset(keys.get(),0xFF,static_cast<std::size_t>(adj) * sizeof(std::uint64_t)),"Failed to init case-2 keys");
+        sync_check("FGV-CS inter-cluster stage failed");
 
-            case2_candidates_kernel<<<blocks,kBlockSize>>>(n,offsets,neighbors,dist.get(),cluster.get(),keys.get(),dsts.get());
-            sync("Case-2 candidates failed");
-
-            thrust::sort_by_key(dp(keys.get()),dp(keys.get()) + adj,dp(dsts.get()));
-
-            auto unique_end = thrust::unique_by_key(dp(keys.get()),dp(keys.get()) + adj,dp(dsts.get()));
-
-            int valid = static_cast<int>(unique_end.first - dp(keys.get()));
-
-            if(valid > 0)
-            {
-                std::uint64_t last_key = 0;
-
-                check_cuda(cudaMemcpy(&last_key,keys.get() + valid - 1,sizeof(last_key),cudaMemcpyDeviceToHost),"Failed to read last case-2 key");
-
-                if(last_key == UINT64_MAX)
-                {
-                    --valid;
-                }
-            }
-
-            if(valid > 0)
-            {
-                std::vector<std::uint64_t> hk(valid);
-                std::vector<int> hd(valid);
-
-                check_cuda(cudaMemcpy(hk.data(),keys.get(),static_cast<std::size_t>(valid) * sizeof(std::uint64_t),cudaMemcpyDeviceToHost),"Failed to copy case-2 keys");
-                check_cuda(cudaMemcpy(hd.data(),dsts.get(),static_cast<std::size_t>(valid) * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy case-2 destinations");
-
-                for(int i = 0;i < valid;++i)
-                {
-                    raw.push_back(Edge{static_cast<int>(hk[i] / static_cast<std::uint64_t>(n)),hd[i]});
-                }
-            }
-        }
-
-        // ---- Canonicalize, sort, unique (same as FGV / Compact)
-        edges_.reserve(raw.size());
-
-        for(Edge e : raw)
-        {
-            if(e.source == e.destination)
-            {
-                continue;
-            }
-
-            if(e.source > e.destination)
-            {
-                std::swap(e.source,e.destination);
-            }
-
-            edges_.push_back(e);
-        }
-
-        std::sort(edges_.begin(),edges_.end(),[](const Edge& a,const Edge& b)
-        {
-            return a.source != b.source ? a.source < b.source : a.destination < b.destination;
-        });
-
-        edges_.erase(std::unique(edges_.begin(),edges_.end(),[](const Edge& a,const Edge& b)
-        {
-            return a.source == b.source && a.destination == b.destination;
-        }),edges_.end());
+        edges_ = collect(sink,sink_count,capacity);
     }
 
     const std::vector<Edge>& FGVCompact::edges() const noexcept

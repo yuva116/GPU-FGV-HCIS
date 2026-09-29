@@ -70,6 +70,11 @@ namespace
                 continue;
             }
 
+            if(neighbor_center == vertex_center)
+            {
+                continue;   // FGV-Rule(u,C) is only for clusters C that do not contain u
+            }
+
             const int candidate_distance = neighbor_distance + 1;
 
             const bool same_level = candidate_distance == vertex_distance;

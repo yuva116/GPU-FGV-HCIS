@@ -1,4 +1,5 @@
 #include "algorithms/fgv/fgv.hpp"
+#include "gpu/edge_finalize.hpp"
 #include "gpu/kernels.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -83,53 +84,22 @@ namespace spanner
             throw std::runtime_error("FGV spanner exceeded allocated edge capacity");
         }
 
-        std::vector<int> host_sources(static_cast<std::size_t>(host_edge_count));
-        std::vector<int> host_destinations(static_cast<std::size_t>(host_edge_count));
-
-        if(host_edge_count > 0)
+        // canonicalize + sort + unique on the GPU, copy only the final edge list
+        try
         {
-            check_cuda(cudaMemcpy(host_sources.data(),spanner_sources,static_cast<std::size_t>(host_edge_count) * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy FGV spanner sources");
-
-            check_cuda(cudaMemcpy(host_destinations.data(),spanner_destinations,static_cast<std::size_t>(host_edge_count) * sizeof(int),cudaMemcpyDeviceToHost),"Failed to copy FGV spanner destinations");
+            edges_ = finalize_edges(spanner_sources,spanner_destinations,host_edge_count);
         }
-
-        edges_.clear();
-        edges_.reserve(static_cast<std::size_t>(host_edge_count));
-
-        for(int i = 0;i < host_edge_count;++i)
+        catch(...)
         {
-            const int source = host_sources[i];
-            const int destination = host_destinations[i];
-
-            if(source == destination)
-            {
-                continue;
-            }
-
-            if(source < destination)
-            {
-                edges_.push_back({source,destination});
-            }
-            else
-            {
-                edges_.push_back({destination,source});
-            }
+            cudaFree(shifts);
+            cudaFree(distances);
+            cudaFree(centers);
+            cudaFree(parents);
+            cudaFree(edge_count);
+            cudaFree(spanner_sources);
+            cudaFree(spanner_destinations);
+            throw;
         }
-
-        std::sort(edges_.begin(),edges_.end(),[](const Edge& lhs,const Edge& rhs)
-        {
-            if(lhs.source != rhs.source)
-            {
-                return lhs.source < rhs.source;
-            }
-
-            return lhs.destination < rhs.destination;
-        });
-
-        edges_.erase(std::unique(edges_.begin(),edges_.end(),[](const Edge& lhs,const Edge& rhs)
-        {
-            return lhs.source == rhs.source && lhs.destination == rhs.destination;
-        }),edges_.end());
 
         cudaFree(shifts);
         cudaFree(distances);

@@ -26,6 +26,7 @@ target_include_directories(spanner_graph PUBLIC
 
 add_library(spanner_gpu STATIC
     src/gpu/gpu_graph.cu
+    src/gpu/edge_finalize.cu
 
     src/gpu/fgv/fgv_shift.cu
     src/gpu/fgv/fgv_cluster.cu

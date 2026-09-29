@@ -1,5 +1,9 @@
 #pragma once
 
+#include <vector>
+
+#include "graph/edge.hpp"
+
 namespace spanner
 {
     // max_iterations  : stop after this many HCIS phases (alpha); 0 = run until no active vertex remains.
@@ -10,8 +14,8 @@ namespace spanner
     // (Unlike grow_compact_clusters, this never repairs / extends past `depth`.)
     void grow_compact_bfs(int num_vertices,int depth,const int* offsets,const int* neighbors,const int* is_center,int* distances,int* centers,int* parents);
 
-    // Number of edges between BFS level `radius` and `radius + 1` when BFS-ing from `seeds`.
-    long long count_compact_boundary_edges(int num_vertices,int radius,const int* offsets,const int* neighbors,const int* seeds);
+    // Full CS pipeline (Sec. 3.3): HCIS-r -> radius-r BFS clusters -> tree + inter-cluster edges -> sorted unique edges.
+    void run_compact_pipeline(const int* offsets,const int* neighbors,int num_vertices,int num_adjacency_entries,int radius,std::vector<Edge>& edges,int& num_centers);
 
     void initialize_compact_active_set(int num_vertices,int* active,int* active_neighbors);
 

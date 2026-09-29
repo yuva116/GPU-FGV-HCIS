@@ -47,6 +47,8 @@ add_library(spanner_gpu STATIC
     src/algorithms/fgv/fgv.cpp
     src/algorithms/compact/compact.cpp
     src/algorithms/miller/miller.cpp
+    src/algorithms/mpvx-cs/mpvx-cs.cpp
+    src/gpu/compact/mpvx_cs.cu
 )
 
 target_include_directories(spanner_gpu PUBLIC
@@ -117,6 +119,14 @@ add_executable(test_fgv_compact
 )
 
 target_link_libraries(test_fgv_compact PRIVATE
+    spanner_gpu
+)
+
+add_executable(test_mpvx_cs
+    tests/test_mpvx-cs.cpp
+)
+
+target_link_libraries(test_mpvx_cs PRIVATE
     spanner_gpu
 )
 

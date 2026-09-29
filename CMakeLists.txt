@@ -28,6 +28,10 @@ add_library(spanner_gpu STATIC
     src/gpu/gpu_graph.cu
     src/gpu/edge_finalize.cu
 
+    src/gpu/miller/miller_shift.cu
+    src/gpu/miller/miller_cluster.cu
+    src/gpu/miller/miller_spanner.cu
+
     src/gpu/fgv/fgv_shift.cu
     src/gpu/fgv/fgv_cluster.cu
     src/gpu/fgv/fgv_spanner.cu
@@ -42,6 +46,7 @@ add_library(spanner_gpu STATIC
 
     src/algorithms/fgv/fgv.cpp
     src/algorithms/compact/compact.cpp
+    src/algorithms/miller/miller.cpp
 )
 
 target_include_directories(spanner_gpu PUBLIC
@@ -71,6 +76,14 @@ add_executable(test_fgv
 )
 
 target_link_libraries(test_fgv PRIVATE
+    spanner_gpu
+)
+
+add_executable(test_miller
+    tests/test_miller.cpp
+)
+
+target_link_libraries(test_miller PRIVATE
     spanner_gpu
 )
 

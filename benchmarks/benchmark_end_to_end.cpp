@@ -1,9 +1,11 @@
 // Usage: run_benchmark <out.csv> <snap_graph.txt> [more graphs...]
-// Runs FGV (baseline), Compact (CS) and the hybrid FGV-CS at stretch 3, 5, 7 on every graph
-// and writes one CSV row per (graph, algorithm, stretch).
+// Runs FGV (baseline), Compact (CS) and the hybrid FGV-CS at stretch 3, 5, 7 on every graph,
+// plus MPVX5-B (Miller) and MPVX5-CS at stretch 5, and writes one CSV row per (graph, algorithm, stretch).
 #include "algorithms/compact/compact.hpp"
 #include "algorithms/compact/fgv_compact.hpp"
 #include "algorithms/fgv/fgv.hpp"
+#include "algorithms/miller/miller.hpp"
+#include "algorithms/mpvx-cs/mpvx-cs.hpp"
 #include "graph/csr.hpp"
 #include "graph/graph_loader.hpp"
 #include "gpu/gpu_graph.hpp"
@@ -72,6 +74,28 @@ int main(int argc, char** argv)
                 spanner::FGVCompact hybrid(gpu, (stretch + 1) / 2); // stretch = 2k-1
                 hybrid.run();
                 record("FGV-CS", hybrid.edges().size(), t.elapsed_milliseconds());
+
+                if (stretch == 5)
+                {
+                    // MPVX baseline and its compact variant; guarded so a failure here
+                    // does not discard the FGV/CS rows already recorded for this graph.
+                    try
+                    {
+                        t.reset();
+                        spanner::Miller mpvx(gpu, (stretch - 1) / 4);      // MPVX stretch = 4k+1 -> k=1 for stretch 5
+                        mpvx.run();
+                        record("MPVX5-B", mpvx.edges().size(), t.elapsed_milliseconds());
+
+                        t.reset();
+                        spanner::MPVXCS mpvx_cs(gpu, (stretch - 1) / 4);   // MPVX-CS stretch = 4k+1 -> k=1 for stretch 5
+                        mpvx_cs.run();
+                        record("MPVX5-CS", mpvx_cs.edges().size(), t.elapsed_milliseconds());
+                    }
+                    catch (const std::exception& e)
+                    {
+                        std::cerr << "skipping MPVX on " << name << ": " << e.what() << '\n';
+                    }
+                }
             }
         }
         catch (const std::exception& e)

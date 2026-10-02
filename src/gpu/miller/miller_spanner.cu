@@ -55,7 +55,7 @@ namespace
             const int neighbor = neighbors[index];
             const int vertex_cluster = centers[vertex];
             const int neighbor_cluster = centers[neighbor];
-            if(vertex_cluster >= neighbor_cluster)
+            if(neighbor == vertex || vertex_cluster >= neighbor_cluster)
             {
                 continue;
             }

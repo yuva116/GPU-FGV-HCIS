@@ -13,6 +13,20 @@
 
 namespace
 {
+    __global__ void canonicalize_unique_edges_kernel(int count,const int* src,const int* dst,spanner::Edge* edges)
+    {
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if(i >= count)
+        {
+            return;
+        }
+
+        const int a = src[i];
+        const int b = dst[i];
+        edges[i] = a < b ? spanner::Edge{a,b} : spanner::Edge{b,a};
+    }
+
     __global__ void pack_edges_kernel(int count,const int* src,const int* dst,std::uint64_t* keys)
     {
         const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -40,6 +54,22 @@ namespace
 
 namespace spanner
 {
+    std::vector<Edge> copy_canonical_unique_edges(const int* src,const int* dst,int count)
+    {
+        if(count <= 0)
+        {
+            return {};
+        }
+
+        detail::DeviceBuffer<Edge> canonical_edges(static_cast<std::size_t>(count));
+        canonicalize_unique_edges_kernel<<<detail::grid_size(count),detail::kBlockSize>>>(count,src,dst,canonical_edges.get());
+        detail::check_cuda(cudaGetLastError(),"Edge canonicalization launch failed");
+
+        std::vector<Edge> edges(static_cast<std::size_t>(count));
+        detail::check_cuda(cudaMemcpy(edges.data(),canonical_edges.get(),static_cast<std::size_t>(count) * sizeof(Edge),cudaMemcpyDeviceToHost),"Failed to copy canonical edges");
+        return edges;
+    }
+
     std::vector<Edge> finalize_packed_edges(std::uint64_t* keys,int count)
     {
         std::vector<Edge> edges;

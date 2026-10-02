@@ -109,6 +109,7 @@ void validate_edges(const spanner::CSRGraph& graph, const std::vector<spanner::E
         throw std::runtime_error("Miller produced an empty spanner");
     }
 
+    std::unordered_set<std::uint64_t> seen_edges;
     for (const spanner::Edge& edge : edges) {
         if (edge.source == edge.destination) {
             throw std::runtime_error("Miller produced a self-loop");
@@ -122,13 +123,10 @@ void validate_edges(const spanner::CSRGraph& graph, const std::vector<spanner::E
         if (!has_input_edge(graph, edge.source, edge.destination)) {
             throw std::runtime_error("Miller produced an edge not present in the input graph");
         }
-    }
-
-    for (std::size_t index = 1; index < edges.size(); ++index) {
-        const spanner::Edge& previous = edges[index - 1];
-        const spanner::Edge& current = edges[index];
-        if (previous.source > current.source || (previous.source == current.source && previous.destination >= current.destination)) {
-            throw std::runtime_error("Miller edges are not sorted and unique");
+        const std::uint64_t edge_key = (static_cast<std::uint64_t>(edge.source) << 32) |
+                                       static_cast<std::uint32_t>(edge.destination);
+        if (!seen_edges.insert(edge_key).second) {
+            throw std::runtime_error("Miller produced a duplicate edge");
         }
     }
 }
